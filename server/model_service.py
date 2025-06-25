@@ -1,98 +1,104 @@
-"""
-Service for interacting with DeepSeek Coder via Ollama
-"""
 import requests
-from typing import Dict, Optional, List
+import json
 import re
 import logging
+from typing import Dict, List, Any
 
 from config import OLLAMA_MODEL, OLLAMA_BASE_URL, MODEL_TEMPERATURE, MODEL_MAX_TOKENS
-from schemas import RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
+
 class ModelService:
+
     def __init__(self):
         self.model = OLLAMA_MODEL
         self.base_url = OLLAMA_BASE_URL
         self.api_url = f"{self.base_url}/api/generate"
 
-    def create_prompt(
-        self, 
-        code: str,
-        numpy_version: str,
-        detected_functions: List[str],
-        retrieved_context: Dict[str, List[RetrievedChunk]]
-    ) -> str:
+    def create_prompt(self, code: str, version: str, funcs: List[str], ctx: Dict[str, List[Dict[str, Any]]]) -> str:
         context_parts = []
-        for func_name, chunks in retrieved_context.items():
-            if chunks and chunks[0].similarity_score > 0.7:
-                context_parts.append(f"\n{func_name}: {chunks[0].content[:200]}")
+        for fn, chunks in ctx.items():
+            if chunks:
+                for chunk in chunks[:3]:
+                    if chunk['similarity_score'] > 0.4:
+                        content = chunk['content'].replace('\n', ' ')[:600]
+                        context_parts.append(f"- {content}")
 
-        context = "\n".join(context_parts) if context_parts else ""
+        context_section = "\n".join(context_parts) if context_parts else "No deprecation information found."
 
-        prompt = f"""You are a NumPy expert. Modernize this NumPy {numpy_version} code by replacing deprecated functions.
+        prompt = f"""You are a NumPy expert. Modernize NumPy {version} code by replacing deprecated functions.
 
-Code:
+Deprecation Information:
+{context_section}
+
+Code to modernize:
 ```python
 {code}
 ```
 
-Detected functions: {', '.join(detected_functions)}
+For each deprecated function call, provide the exact code snippet that needs to be replaced and its modernized version.
 
-{context}
+Respond in JSON format:
+{{
+  "code": "full modernized code here",
+  "changes": [
+    {{"input": "exact_deprecated_code_snippet", "modernized_code": "exact_replacement_snippet", "reason": "explanation"}}
+  ]
+}}
 
-Provide:
-1. Modernized code
-2. What was deprecated and the modern replacement
-
-Response:"""
-
+JSON Response:"""
+        
         return prompt
 
-    def parse_response(self, response_text: str, original_code: str) -> Dict:
+    def parse_response(self, resp_text: str, orig_code: str) -> Dict[str, Any]:
         try:
-            logger.debug("Raw model response: %s", response_text)
+            json_match = re.search(r'\{[\s\S]*\}', resp_text)
+            if json_match:
+                data = json.loads(json_match.group())
+                return {
+                    "modernized_code": data.get("code", orig_code),
+                    "changes": data.get("changes", []),
+                    "success": bool(data.get("code") and data.get("code") != orig_code)
+                }
+        except json.JSONDecodeError:
+            logger.warning("JSON parse failed, using fallback")
+        
+        code_blocks = re.findall(r'```(?:python)?\n(.*?)\n```', resp_text, re.DOTALL)
+        code = code_blocks[0].strip() if code_blocks else orig_code
+        
+        changes = []
+        deprecated_patterns = [
+            r'(np\.\w+_?\([^)]*\))',  # np.function() calls
+            r'(numpy\.\w+_?\([^)]*\))',  # numpy.function() calls
+            r'(\w+\s*=\s*np\.\w+)',  # assignments like dtype = np.int, probably need even more
+        ]
+        
+        for pattern in deprecated_patterns:
+            for match in re.finditer(pattern, orig_code):
+                snippet = match.group(1)
+                if 'deprecated' in resp_text.lower() and snippet in resp_text:
+                    changes.append({
+                        "input": snippet,
+                        "modernized_code": snippet,  # Fallback: same as input
+                        "reason": "Deprecated function detected"
+                    })
+        
+        return {
+            "modernized_code": code,
+            "changes": changes,
+            "success": code != orig_code
+        }
 
-            code_blocks = re.findall(r'```(?:python)?\n(.*?)\n```', response_text, re.DOTALL)
-            modernized_code = code_blocks[0].strip() if code_blocks else original_code
-
-            deprecation_info = ""
-            explanation_lines = []
-            for line in response_text.splitlines():
-                if any(keyword in line.lower() for keyword in ["deprecated", "replacement", "use"]):
-                    explanation_lines.append(line.strip())
-            deprecation_info = " ".join(explanation_lines[:3]) if explanation_lines else "No deprecation explanation."
-
-            deprecated_funcs = list(set(re.findall(r'(\w+) is deprecated', response_text)))
-
-            return {
-                "modernized_code": modernized_code,
-                "deprecated_functions": deprecated_funcs,
-                "deprecation_info": deprecation_info,
-                "success": modernized_code != original_code
-            }
-
-        except Exception as e:
-            logger.exception("Failed to parse model response")
-            return {
-                "modernized_code": original_code,
-                "deprecated_functions": [],
-                "deprecation_info": f"Error parsing response: {str(e)}",
-                "success": False
-            }
-
-    def call_model(
-        self,
-        code: str,
-        numpy_version: str,
-        detected_functions: List[str],
-        retrieved_context: Dict[str, List[RetrievedChunk]]
-    ) -> Dict:
-        prompt = self.create_prompt(code, numpy_version, detected_functions, retrieved_context)
-
+    # Call model with prompt
+    def call_model(self, code: str, version: str, funcs: List[str], ctx: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+        prompt = self.create_prompt(code, version, funcs, ctx)
+        
+        logger.info(f"Calling model for {len(funcs)} functions")
+        logger.debug(f"Prompt length: {len(prompt)} chars")
+        
         try:
-            response = requests.post(
+            resp = requests.post(
                 self.api_url,
                 json={
                     "model": self.model,
@@ -103,33 +109,34 @@ Response:"""
                         "num_predict": MODEL_MAX_TOKENS
                     }
                 },
-                timeout=30
+                timeout = 30
             )
-
-            if response.status_code == 200:
-                result = response.json()
-                return self.parse_response(result.get("response", ""), code)
+            
+            if resp.status_code == 200:
+                result = resp.json()
+                response_text = result.get("response", "")
+                logger.debug(f"Model response length: {len(response_text)} chars")
+                return self.parse_response(response_text, code)
             else:
-                logger.error("Model call failed with status code %d: %s", response.status_code, response.text)
+                logger.error(f"Model call failed: {resp.status_code}")
                 return {
                     "modernized_code": code,
-                    "deprecated_functions": [],
-                    "deprecation_info": f"Model request failed with status code {response.status_code}",
+                    "changes": [],
                     "success": False
                 }
-
+                
         except Exception as e:
-            logger.exception("Exception during model call")
+            logger.exception("Model call exception")
             return {
                 "modernized_code": code,
-                "deprecated_functions": [],
-                "deprecation_info": f"Error calling model: {str(e)}",
+                "changes": [],
                 "success": False
             }
 
+    # Check Ollama availability
     def is_available(self) -> bool:
         try:
-            response = requests.get(f"{self.base_url}/api/tags", timeout=2)
-            return response.status_code == 200
+            resp = requests.get(f"{self.base_url}/api/tags", timeout=2)
+            return resp.status_code == 200
         except:
             return False

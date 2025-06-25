@@ -22,10 +22,10 @@ def main():
     all_docs = db.get()
     print(f"Total documents in collection: {len(all_docs['documents'])}")
 
-    query = "numpy.fromstring"
+    query = "np.irr"
 
     print(f"Running similarity search for query: '{query}'\n")
-    results = db.similarity_search_with_relevance_scores(query, k=5)
+    results = db.similarity_search_with_relevance_scores(query, k=3)
 
     for i, (doc, score) in enumerate(results):
         print(f"\n--- Result #{i+1} ---")
