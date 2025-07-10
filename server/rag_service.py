@@ -21,7 +21,7 @@ class NumpyFunctionExtractor(ast.NodeVisitor):
         self.funcs: List[FunctionInfo] = []
     
     # Extract NumPy function calls from AST
-    def visit_call(self, node: ast.Call) -> None:
+    def visit_Call(self, node: ast.Call) -> None:
         name = self._get_name(node.func)
         if name and self._is_numpy(name):
             self.funcs.append(FunctionInfo(
@@ -50,10 +50,10 @@ class NumpyFunctionExtractor(ast.NodeVisitor):
         return len(parts) > 1 and parts[0] in self.aliases
 
 class RAGService:
-    def __init__(self):
+    def __init__(self, model_name: str = None):
         self.collection: Any = None
         self._init_chroma()
-        self.model = ModelService()
+        self.model = ModelService(model_name)
         
     # Initialize ChromaDB connection
     def _init_chroma(self) -> None:
